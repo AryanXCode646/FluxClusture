@@ -1,9 +1,11 @@
 import { 
-    RectAreaLight, 
-    SpotLight, 
     DirectionalLight, 
     PointLight 
 } from 'three';
+import { 
+    ShapedAreaLight, 
+    PhysicalSpotLight 
+} from 'three-gpu-pathtracer';
 
 /**
  * Traverses the GLB scene, finds placeholder Point lights by name, 
@@ -30,13 +32,15 @@ export function upgradeSceneLights(scene) {
                 // Area lights use the placeholder's scale for physical dimensions
                 const width = child.scale.x;
                 const height = child.scale.y;
-                newLight = new RectAreaLight(color, intensity, width, height);
+                newLight = new ShapedAreaLight(color, intensity, width, height);
+                newLight.isCircular = false;
                 newLight.position.copy(position);
                 newLight.rotation.copy(rotation);
             } 
             else if (name.includes('spot')) {
                 // Spot lights: Math.PI/4 (45 degrees) is a safe default angle
-                newLight = new SpotLight(color, intensity, distance, Math.PI / 4, 0.5, decay);
+                newLight = new PhysicalSpotLight(color, intensity, distance, Math.PI / 4, 0.5, decay);
+                newLight.radius = 0.05; // Set a small physical radius for soft shadows
                 newLight.position.copy(position);
                 newLight.rotation.copy(rotation);
             } 

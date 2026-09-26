@@ -8,6 +8,9 @@ const UploadAfter = () => {
     const location = useLocation();
     const config = location.state || {};
 
+    const chunkW = 256;
+    const chunkH = 256;
+
     const {
         roomId = '',
         file = null,
@@ -50,8 +53,7 @@ const UploadAfter = () => {
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
         if (!ctx) return;
 
-        const chunkW = 64;
-        const chunkH = 64;
+
         const raw = new Uint8ClampedArray(pixelBuffer);
         const flipped = new Uint8ClampedArray(raw.length);
         const rowSize = chunkW * 4;
@@ -90,7 +92,7 @@ const UploadAfter = () => {
         workerRef.current = worker;
 
         try {
-            const offscreen = new OffscreenCanvas(64, 64);
+            const offscreen = new OffscreenCanvas(chunkW, chunkH);
             worker.postMessage({ type: 'INIT_CANVAS', canvas: offscreen }, [offscreen]);
         } catch (err) {
             console.warn("Could not transfer OffscreenCanvas, letting worker self-initialize:", err);
@@ -156,7 +158,9 @@ const UploadAfter = () => {
                         frame: enrichedTask.frame,
                         fps: fps,
                         samples: samples,
-                        noiseThreshold: noiseThreshold
+                        noiseThreshold: noiseThreshold,
+                        chunkWidth: chunkW,
+                        chunkHeight: chunkH,
                     });
                 });
                 pendingChunksRef.current = [];
@@ -226,7 +230,9 @@ const UploadAfter = () => {
                     frame: enrichedTask.frame,
                     fps: fps,
                     samples: samples,
-                    noiseThreshold: noiseThreshold
+                    noiseThreshold: noiseThreshold,
+                    chunkWidth: chunkW,
+                    chunkHeight: chunkH,
                 });
             }
         });
@@ -364,8 +370,8 @@ const UploadAfter = () => {
                 />
             </div>
             <div className='w-full flex justify-center'>
-                
-                    {(1-progress)?
+
+                {(1 - progress) ?
                     <div className='w-[90%] border h-7 flex items-center'>
                         <div
                             className='h-full bg-white text-black p-1 flex items-center justify-center transition-all duration-150 text-xs font-bold'
@@ -373,13 +379,13 @@ const UploadAfter = () => {
                         >
                             {(progress * 100).toFixed(1)}%
                         </div>
-                        </div>
-                        : 
-                        <button className='h-full aspect-5/1 bg-none border border-white text-white' onClick={handleExportVideo}>
-                            Export video
-                        </button>
-                    }
-                
+                    </div>
+                    :
+                    <button className='h-full aspect-5/1 bg-none border border-white text-white' onClick={handleExportVideo}>
+                        Export video
+                    </button>
+                }
+
             </div>
         </div>
     );

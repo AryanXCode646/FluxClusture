@@ -19,6 +19,10 @@ const JoinAfter = () => {
     const isSceneReadyRef = useRef(false);
     const pendingChunksRef = useRef([]);
 
+
+    const chunkW = 256;
+    const chunkH = 256;
+
     useEffect(() => {
         if (!roomID) return;
 
@@ -39,9 +43,7 @@ const JoinAfter = () => {
                 if (!canvasRef.current || !pixels) return;
                 const ctx = canvasRef.current.getContext('2d');
                 if (!ctx) return;
-                
-                const chunkW = 64;
-                const chunkH = 64;
+
                 const raw = new Uint8ClampedArray(pixels);
                 const flipped = new Uint8ClampedArray(raw.length);
                 const rowSize = chunkW * 4;
@@ -51,11 +53,11 @@ const JoinAfter = () => {
                     const dstRow = y * rowSize;
                     flipped.set(raw.subarray(srcRow, srcRow + rowSize), dstRow);
                 }
-                
+
                 for (let i = 3; i < flipped.length; i += 4) {
                     flipped[i] = 255;
                 }
-                
+
                 const imgData = new ImageData(flipped, chunkW, chunkH);
                 ctx.putImageData(imgData, 0, 0);
             };
@@ -75,7 +77,7 @@ const JoinAfter = () => {
                 // Hand the final pixel array to SwarmClient to blast over WebRTC
                 swarmClient.submitRenderedTile(task, pixels);
             }
-            
+
             if (data.type === 'ERROR') {
                 console.error("[RenderWorker Error]:", data.message);
             }
@@ -94,7 +96,9 @@ const JoinAfter = () => {
                         frame: parseInt(task.frame, 10),
                         samples: parseInt(swarmClient.samples, 10),
                         noiseThreshold: parseFloat(swarmClient.noise),
-                        fps: parseInt(swarmClient.fps, 10)
+                        fps: parseInt(swarmClient.fps, 10),
+                        chunkWidth: chunkW,
+                        chunkHeight: chunkH,
                     });
                 });
                 pendingChunksRef.current = [];
@@ -108,7 +112,7 @@ const JoinAfter = () => {
 
         swarmClient.on('fileReady', async () => {
             if (!isSubscribed) return;
-            
+
             setSettings({
                 samples: parseInt(swarmClient.samples, 10),
                 noiseThreshold: parseFloat(swarmClient.noise),
@@ -121,14 +125,14 @@ const JoinAfter = () => {
             if (swarmClient.glbBuffer) {
                 setStatus("Verifying GLB file...");
                 const hash = await generateFileHash(swarmClient.glbBuffer);
-                
+
                 if (hash !== swarmClient.glbHash) {
                     console.error("GLB hash mismatch! Expected:", swarmClient.glbHash, "Got:", hash);
                     setStatus("Hash mismatch. Requesting GLB again...");
                     swarmClient.socketManager.emit('REQUEST_SEEDER', { roomId: roomID });
                     return;
                 }
-                
+
                 setStatus("GLB verified. Setting up scene...");
 
                 workerRef.current.postMessage({
@@ -140,7 +144,7 @@ const JoinAfter = () => {
                     totalHeight: parseInt(swarmClient.height, 10),
                     frame: 0
                 });
-                
+
                 // Start taking rendering jobs
                 swarmClient.socketManager.emit('REQUEST_TASK');
             }
@@ -148,7 +152,7 @@ const JoinAfter = () => {
 
         swarmClient.on('newTask', (task) => {
             if (!isSubscribed) return;
-            
+
             setCurrentFrame(parseInt(task.frame, 10));
             setChunkAssigned(task.id || `${task.startX}_x_${task.startY}`);
             setProgress(0); // reset progress
@@ -167,7 +171,9 @@ const JoinAfter = () => {
                     frame: parseInt(task.frame, 10),
                     samples: parseInt(swarmClient.samples, 10),
                     noiseThreshold: parseFloat(swarmClient.noise),
-                    fps: parseInt(swarmClient.fps, 10)
+                    fps: parseInt(swarmClient.fps, 10),
+                    chunkWidth: chunkW,
+                    chunkHeight: chunkH,
                 });
             }
         });
@@ -199,7 +205,7 @@ const JoinAfter = () => {
                     <div className='geist-mono-bold mb-10 text-white'>
                         room : {roomID}
                     </div>
-                    
+
                     <div className='text-xs text-gray-400 mb-4'>Status: {status}</div>
 
                     <div className='text-[#606060] mb-10'>
@@ -229,26 +235,26 @@ const JoinAfter = () => {
                         </div>
                     </div>
                 </div>
-                
+
                 <div className='aspect-square w-5/16 bg-[#1a1a1a] flex items-center justify-center overflow-hidden border border-gray-800 rounded'>
                     {/* 
                         Size the internal canvas buffer to exactly 64x64 so it matches the chunk, 
                         and let CSS scale it up to fill the container.
                         'imageRendering: pixelated' keeps it sharp if you want to see the pixels.
                     */}
-                    <canvas 
-                        ref={canvasRef} 
-                        width={64} 
-                        height={64} 
+                    <canvas
+                        ref={canvasRef}
+                        width={64}
+                        height={64}
                         className="w-full h-full"
                     />
                 </div>
             </div>
-            
+
             <div className='w-full flex justify-center mt-6'>
                 <div className='w-full border h-7'>
-                    <div 
-                        className='h-full bg-white text-black p-1 flex items-center justify-center transition-all duration-150 text-xs font-bold' 
+                    <div
+                        className='h-full bg-white text-black p-1 flex items-center justify-center transition-all duration-150 text-xs font-bold'
                         style={{ width: `${Math.max(2, progress * 100)}%` }}
                     >
                         {(progress * 100).toFixed(1)}%

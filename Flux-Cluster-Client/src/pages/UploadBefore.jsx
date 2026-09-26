@@ -26,8 +26,8 @@ const UploadBefore = () => {
     const [samples, setSamples] = useState(1024)
     const [noiseThreshold, setNoiseThreshold] = useState(0.1)
 
-    const [width, setWidth] = useState(1900);
-    const [height, setHeight] = useState(1400);
+    const [width, setWidth] = useState(1920);
+    const [height, setHeight] = useState(1080);
 
     const [min, setMin] = useState(0);
     const [max, setMax] = useState(120);
