@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { WebGLPathTracer } from 'three-gpu-pathtracer';
 import { swarmClient } from '../services/SwarmClient';
 import { loadGLB } from '../render/modelLoader';
-import { upgradeSceneLights } from '../render/upgradeLights';
+import { upgradeSceneLights, worldBackgroundColor } from '../render/upgradeLights';
 import { renderChunk } from '../render/gpuRenderer';
 import { generateFileHash } from '../utils/helper';
 
@@ -154,20 +154,8 @@ export function useRenderPipeline({
                 sceneRef.current.add(gltf.scene);
 
                 const giConfig = upgradeSceneLights(sceneRef.current);
-                if (giConfig && giConfig.color !== undefined) {
-                    let r, g, b;
-                    if (giConfig.color.isColor) {
-                        r = giConfig.color.r; g = giConfig.color.g; b = giConfig.color.b;
-                    } else {
-                        r = ((giConfig.color >> 16) & 255) / 255;
-                        g = ((giConfig.color >> 8) & 255) / 255;
-                        b = (giConfig.color & 255) / 255;
-                    }
-                    sceneRef.current.background = new THREE.Color(r, g, b);
-                    sceneRef.current.backgroundIntensity = giConfig.intensity || 1.0;
-                } else {
-                    sceneRef.current.background = new THREE.Color(0x000000);
-                }
+                sceneRef.current.background = worldBackgroundColor(giConfig && giConfig.color);
+                sceneRef.current.backgroundIntensity = (giConfig && giConfig.intensity) || 1.0;
 
                 const animIndex = role === 'master' ? (config?.animationIndex || 0) : (parseInt(swarmClient.animationIndex, 10) || 0);
                 if (gltf.animations && gltf.animations.length > 0) {
@@ -348,14 +336,17 @@ export function useRenderPipeline({
         return () => {
             isSubscribed = false;
             abortController.abort();
-            
+
+            if (pathTracerRef.current) {
+                pathTracerRef.current.dispose();
+                pathTracerRef.current = null;
+            }
             if (rendererRef.current) {
                 rendererRef.current.dispose();
                 rendererRef.current.forceContextLoss();
                 rendererRef.current = null;
             }
-            pathTracerRef.current = null;
-            
+
             if (swarmClient.socketManager.socket) {
                 swarmClient.socketManager.socket.disconnect();
             }
