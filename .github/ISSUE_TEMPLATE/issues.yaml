@@ -1,0 +1,63 @@
+name: Bug Report
+description: File a bug report to help us improve the FluxCluster rendering grid.
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report! 
+        Please provide as much context as possible to help us reproduce the issue.
+  - type: input
+    id: role
+    attributes:
+      label: Node Role
+      description: Did this happen on the Master (Viewer) node or a Worker (Swarm) node?
+      placeholder: e.g., Master Node, Worker Node
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Tell us what went wrong...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this bug?
+      value: |
+        1. Open '...'
+        2. Upload GLB '...'
+        3. Join as Worker in Room '...'
+        4. See error...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: A clear and concise description of what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Stack Trace
+      description: Please paste any relevant console logs from the browser dev tools or the Orchestrator Node.js server.
+      render: shell
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      description: Please select your operating system and browser.
+      options:
+        - Windows (Chrome/Edge)
+        - macOS (Chrome/Safari)
+        - Linux (Chrome/Firefox)
+        - Other (Please specify in description)
+    validations:
+      required: true
