@@ -1,15 +1,11 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useState, useRef } from 'react';
 import { useLocation } from 'react-router-dom';
-import { swarmClient } from '../services/SwarmClient';
-import RenderWorker from '../render/renderWorker.js?worker';
 import { encodeFramesToMP4 } from '../render/videoExporter';
+import { useRenderPipeline } from '../hooks/useRenderPipeline';
 
 const UploadAfter = () => {
     const location = useLocation();
     const config = location.state || {};
-
-    const chunkW = 256;
-    const chunkH = 256;
 
     const {
         roomId = '',
@@ -30,21 +26,10 @@ const UploadAfter = () => {
     const [status, setStatus] = useState("Initializing...");
     const [progress, setProgress] = useState(0);
     const [currentFrame, setCurrentFrame] = useState(startFrame);
-    const currentFrameRef = useRef(startFrame);
     const [chunkAssigned, setChunkAssigned] = useState("idle");
 
     const containerCanvas = useRef(null);
     const canvasRef = useRef(null);
-    const workerRef = useRef(null);
-    const completedTilesRef = useRef(0);
-    const isSceneReadyRef = useRef(false);
-    const pendingChunksRef = useRef([]);
-
-    const totalFrames = Math.max(1, endFrame - startFrame + 1);
-    const cols = Math.ceil(width / 64);
-    const rows = Math.ceil(height / 64);
-    const totalTiles = totalFrames * cols * rows;
-
     const completedFramesMap = useRef(new Map());
 
     function drawTileToCanvas(metadata, pixelBuffer) {
@@ -53,14 +38,16 @@ const UploadAfter = () => {
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
         if (!ctx) return;
 
+        const tChunkW = parseInt(metadata.chunkWidth, 10) || 128;
+        const tChunkH = parseInt(metadata.chunkHeight, 10) || 128;
 
         const raw = new Uint8ClampedArray(pixelBuffer);
         const flipped = new Uint8ClampedArray(raw.length);
-        const rowSize = chunkW * 4;
+        const rowSize = tChunkW * 4;
 
         // Invert vertically since WebGL readRenderTargetPixels has bottom-left origin
-        for (let y = 0; y < chunkH; y++) {
-            const srcRow = (chunkH - 1 - y) * rowSize;
+        for (let y = 0; y < tChunkH; y++) {
+            const srcRow = (tChunkH - 1 - y) * rowSize;
             const dstRow = y * rowSize;
             flipped.set(raw.subarray(srcRow, srcRow + rowSize), dstRow);
         }
@@ -74,231 +61,38 @@ const UploadAfter = () => {
             if (flipped[i + 2] > maxB) maxB = flipped[i + 2];
         }
 
-        console.log(`[Pipeline] D. Main thread drawing tile to canvas at ${metadata.startX}, ${metadata.startY} | Max RGB: [${maxR}, ${maxG}, ${maxB}]`);
-
-        const imgData = new ImageData(flipped, chunkW, chunkH);
-        const drawWidth = Math.min(chunkW, width - metadata.startX);
-        const drawHeight = Math.min(chunkH, height - metadata.startY);
+        const imgData = new ImageData(flipped, tChunkW, tChunkH);
+        const drawWidth = Math.min(tChunkW, width - metadata.startX);
+        const drawHeight = Math.min(tChunkH, height - metadata.startY);
         ctx.putImageData(imgData, metadata.startX, metadata.startY, 0, 0, drawWidth, drawHeight);
     }
 
-    useEffect(() => {
-        if (!roomId) return;
+    const configObject = React.useMemo(() => ({
+        width, height, fps, samples, noiseThreshold, animationIndex, startFrame, endFrame
+    }), [width, height, fps, samples, noiseThreshold, animationIndex, startFrame, endFrame]);
 
-        let isSubscribed = true;
-
-        // 1. Initialize background RenderWorker
-        const worker = new RenderWorker();
-        workerRef.current = worker;
-
-        try {
-            const offscreen = new OffscreenCanvas(chunkW, chunkH);
-            worker.postMessage({ type: 'INIT_CANVAS', canvas: offscreen }, [offscreen]);
-        } catch (err) {
-            console.warn("Could not transfer OffscreenCanvas, letting worker self-initialize:", err);
-            worker.postMessage({ type: 'INIT_CANVAS' });
-        }
-
-        // 2. Load GLB ArrayBuffer into SwarmClient & RenderWorker
-        async function initModel() {
-            try {
-                let buffer = null;
-                if (file && typeof file.arrayBuffer === 'function') {
-                    buffer = await file.arrayBuffer();
-                } else if (previewUrl) {
-                    const response = await fetch(previewUrl);
-                    buffer = await response.arrayBuffer();
-                }
-
-                if (!isSubscribed) return;
-
-                if (buffer) {
-                    // Seed file to peers over WebRTC
-                    swarmClient.glbBuffer = buffer;
-
-                    // Send a copy to the local worker
-                    worker.postMessage({
-                        type: 'SETUP_SCENE',
-                        fileData: buffer.slice(0),
-                        animationIndex: animationIndex ?? 0,
-                        fps: fps ?? 30,
-                        totalWidth: width,
-                        totalHeight: height,
-                        frame: startFrame ?? 0
-                    });
-                }
-            } catch (err) {
-                console.error("Failed to load GLB file into worker:", err);
-            }
-        }
-
-        initModel();
-
-        // 3. Listen to messages from the background render worker
-        worker.onmessage = (event) => {
-            const data = event.data;
-            if (data.type === 'CHUNK_FINISHED') {
-                const { task, pixels } = data;
-                if (task && pixels) {
-                    swarmClient.submitRenderedTile(task, pixels);
-                }
-            } else if (data.type === 'SCENE_READY') {
-                isSceneReadyRef.current = true;
-
-                // Flush any queued chunks that arrived before the scene was ready
-                pendingChunksRef.current.forEach(enrichedTask => {
-                    worker.postMessage({
-                        type: 'RENDER_CHUNK',
-                        taskId: enrichedTask.id,
-                        task: enrichedTask,
-                        startX: enrichedTask.startX,
-                        startY: enrichedTask.startY,
-                        totalWidth: width,
-                        totalHeight: height,
-                        frame: enrichedTask.frame,
-                        fps: fps,
-                        samples: samples,
-                        noiseThreshold: noiseThreshold,
-                        chunkWidth: chunkW,
-                        chunkHeight: chunkH,
-                    });
-                });
-                pendingChunksRef.current = [];
-            } else if (data.type === 'ERROR') {
-                console.error("[RenderWorker Error]:", data.message);
-            }
-        };
-
-        // 4. Setup SwarmClient callbacks
-        swarmClient.on('status', (msg) => {
-            if (!isSubscribed) return;
-            setStatus(msg);
-        });
-
-
-        swarmClient.on('frameComplete', (task) => {
+    useRenderPipeline({
+        role: 'master',
+        roomId,
+        file,
+        previewUrl,
+        fileHash,
+        config: configObject,
+        setStatus,
+        setProgress,
+        setCurrentFrame,
+        setChunkAssigned,
+        onFrameComplete: (task) => {
             const canvas = canvasRef.current;
             const ctx = canvas.getContext('2d', { willReadFrequently: true });
-
-            // Extract the fully painted frame from the canvas
             const fullFrameData = ctx.getImageData(0, 0, width, height);
-
-            // Save it in our map
             completedFramesMap.current.set(task.frame, fullFrameData);
             console.log(`Successfully saved Frame ${task.frame} to memory.`);
-        })
-
-        swarmClient.on('newTask', (task) => {
-            if (!isSubscribed) return;
-
-            if (currentFrameRef.current !== task.frame) {
-                currentFrameRef.current = task.frame;
-                const canvas = canvasRef.current;
-                if (canvas) {
-                    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-                    if (ctx) {
-                        ctx.fillStyle = 'white';
-                        ctx.fillRect(0, 0, canvas.width, canvas.height);
-                    }
-                }
-            }
-
-            setCurrentFrame(task.frame);
-            setChunkAssigned(task.id || `${task.startX}_x_${task.startY}`);
-
-            const enrichedTask = {
-                ...task,
-                totalWidth: width,
-                totalHeight: height,
-                samples: samples,
-                noiseThreshold: noiseThreshold,
-                fps: fps
-            };
-
-            // Queue chunks if scene is not ready yet, or post immediately
-            if (!isSceneReadyRef.current) {
-                pendingChunksRef.current.push(enrichedTask);
-            } else {
-                worker.postMessage({
-                    type: 'RENDER_CHUNK',
-                    taskId: task.id,
-                    task: enrichedTask,
-                    startX: task.startX,
-                    startY: task.startY,
-                    totalWidth: width,
-                    totalHeight: height,
-                    frame: enrichedTask.frame,
-                    fps: fps,
-                    samples: samples,
-                    noiseThreshold: noiseThreshold,
-                    chunkWidth: chunkW,
-                    chunkHeight: chunkH,
-                });
-            }
-        });
-
-        swarmClient.on('tileReceived', ({ metadata, pixelBuffer }) => {
-            if (!isSubscribed) return;
-            console.log("renderChunk recieved : ", metadata);
-
-            swarmClient.socketManager.emit('ACK_TILE', { id: metadata.taskId, task: { frame: metadata.frame } });
+        },
+        onTileReceived: (metadata, pixelBuffer) => {
             drawTileToCanvas(metadata, pixelBuffer);
-
-
-
-            completedTilesRef.current += 1;
-            if (totalTiles > 0) {
-                const pct = Math.min(1, completedTilesRef.current / totalTiles);
-                setProgress(pct);
-            }
-        });
-
-        // 5. Connect and join as Master node
-        swarmClient.joinAsMaster(roomId);
-        console.log("joined to server as master")
-
-        swarmClient.setRenderSetting(
-            swarmClient.socketManager.id,
-            fileHash,
-            width,
-            height,
-            noiseThreshold,
-            samples,
-            animationIndex,
-            fps
-        );
-
-        swarmClient.startRenderJob(
-            roomId,
-            startFrame,
-            endFrame,
-            width,
-            height,
-            fps,
-            fileHash,
-            samples,
-            noiseThreshold,
-            animationIndex
-        );
-
-        // 6. Cleanup on unmount
-        return () => {
-            isSubscribed = false;
-            if (workerRef.current) {
-                // Send DISPOSE so the worker cleanly destroys the WebGL context before termination
-                workerRef.current.postMessage({ type: 'DISPOSE' });
-                setTimeout(() => {
-                    if (workerRef.current) {
-                        workerRef.current.terminate();
-                        workerRef.current = null;
-                    }
-                }, 100);
-            }
-            if (swarmClient.socketManager.socket) {
-                swarmClient.socketManager.socket.disconnect();
-            }
-        };
-    }, [roomId, file, fileHash, previewUrl, startFrame, endFrame, fps, width, height, samples, noiseThreshold, animationIndex]);
+        }
+    });
 
     const canvasRatio = width / height;
     const containerRatio = 16 / 9;

@@ -1,6 +1,6 @@
 import redis from './connection.js';
 
-const CHUNK_SIZE = 256; 
+const CHUNK_SIZE = 128;
 
 export async function initializeJob(
     roomId, 

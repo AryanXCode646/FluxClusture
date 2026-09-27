@@ -1,8 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useRef, useState } from 'react';
 import { useSearchParams } from "react-router-dom";
-import { swarmClient } from '../services/SwarmClient';
-import RenderWorker from '../render/renderWorker.js?worker';
-import { generateFileHash } from '../utils/helper.js';
+import { useRenderPipeline } from '../hooks/useRenderPipeline';
 
 const JoinAfter = () => {
     const [searchParams] = useSearchParams();
@@ -15,188 +13,43 @@ const JoinAfter = () => {
     const [settings, setSettings] = useState({});
 
     const canvasRef = useRef(null);
-    const workerRef = useRef(null);
-    const isSceneReadyRef = useRef(false);
-    const pendingChunksRef = useRef([]);
 
+    useRenderPipeline({
+        role: 'worker',
+        roomId: roomID,
+        setStatus,
+        setProgress,
+        setCurrentFrame,
+        setChunkAssigned,
+        onSettingsReceived: setSettings,
+        onTileReceived: (metadata, pixelBuffer) => {
+            const task = { chunkWidth: metadata.chunkWidth, chunkHeight: metadata.chunkHeight };
+            const canvas = canvasRef.current;
+            if (!canvas || !pixelBuffer) return;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
 
-    const chunkW = 256;
-    const chunkH = 256;
+            const tChunkW = parseInt(task.chunkWidth, 10) || chunkW;
+            const tChunkH = parseInt(task.chunkHeight, 10) || chunkH;
 
-    useEffect(() => {
-        if (!roomID) return;
+            const raw = new Uint8ClampedArray(pixelBuffer);
+            const flipped = new Uint8ClampedArray(raw.length);
+            const rowSize = tChunkW * 4;
 
-        let isSubscribed = true;
-
-        // 1. Initialize Web Worker
-        workerRef.current = new RenderWorker();
-
-        // Let the worker use its own internal OffscreenCanvas
-        workerRef.current.postMessage({ type: 'INIT_CANVAS' });
-
-        // 2. Setup Worker Message Handler
-        workerRef.current.onmessage = (event) => {
-            if (!isSubscribed) return;
-            const data = event.data;
-
-            const drawPixelsToCanvas = (pixels) => {
-                if (!canvasRef.current || !pixels) return;
-                const ctx = canvasRef.current.getContext('2d');
-                if (!ctx) return;
-
-                const raw = new Uint8ClampedArray(pixels);
-                const flipped = new Uint8ClampedArray(raw.length);
-                const rowSize = chunkW * 4;
-
-                for (let y = 0; y < chunkH; y++) {
-                    const srcRow = (chunkH - 1 - y) * rowSize;
-                    const dstRow = y * rowSize;
-                    flipped.set(raw.subarray(srcRow, srcRow + rowSize), dstRow);
-                }
-
-                for (let i = 3; i < flipped.length; i += 4) {
-                    flipped[i] = 255;
-                }
-
-                const imgData = new ImageData(flipped, chunkW, chunkH);
-                ctx.putImageData(imgData, 0, 0);
-            };
-
-            if (data.type === 'CHUNK_PROGRESS') {
-                if (data.maxSamples > 0) {
-                    setProgress(data.samples / data.maxSamples);
-                }
-                if (data.pixels) {
-                    drawPixelsToCanvas(data.pixels);
-                }
+            for (let y = 0; y < tChunkH; y++) {
+                const srcRow = (tChunkH - 1 - y) * rowSize;
+                const dstRow = y * rowSize;
+                flipped.set(raw.subarray(srcRow, srcRow + rowSize), dstRow);
             }
 
-            if (data.type === 'CHUNK_FINISHED') {
-                const { pixels, task } = data;
-                drawPixelsToCanvas(pixels);
-                // Hand the final pixel array to SwarmClient to blast over WebRTC
-                swarmClient.submitRenderedTile(task, pixels);
+            for (let i = 3; i < flipped.length; i += 4) {
+                flipped[i] = 255;
             }
 
-            if (data.type === 'ERROR') {
-                console.error("[RenderWorker Error]:", data.message);
-            }
-
-            if (data.type === 'SCENE_READY') {
-                isSceneReadyRef.current = true;
-                pendingChunksRef.current.forEach(task => {
-                    workerRef.current.postMessage({
-                        type: 'RENDER_CHUNK',
-                        taskId: task.id,
-                        task: task,
-                        startX: parseInt(task.startX, 10),
-                        startY: parseInt(task.startY, 10),
-                        totalWidth: parseInt(swarmClient.width, 10),
-                        totalHeight: parseInt(swarmClient.height, 10),
-                        frame: parseInt(task.frame, 10),
-                        samples: parseInt(swarmClient.samples, 10),
-                        noiseThreshold: parseFloat(swarmClient.noise),
-                        fps: parseInt(swarmClient.fps, 10),
-                        chunkWidth: chunkW,
-                        chunkHeight: chunkH,
-                    });
-                });
-                pendingChunksRef.current = [];
-            }
-        };
-
-        // 3. Setup SwarmClient Listeners
-        swarmClient.on('status', (msg) => {
-            if (isSubscribed) setStatus(msg);
-        });
-
-        swarmClient.on('fileReady', async () => {
-            if (!isSubscribed) return;
-
-            setSettings({
-                samples: parseInt(swarmClient.samples, 10),
-                noiseThreshold: parseFloat(swarmClient.noise),
-                fps: parseInt(swarmClient.fps, 10),
-                width: parseInt(swarmClient.width, 10),
-                height: parseInt(swarmClient.height, 10),
-                animationIndex: parseInt(swarmClient.animationIndex, 10)
-            });
-
-            if (swarmClient.glbBuffer) {
-                setStatus("Verifying GLB file...");
-                const hash = await generateFileHash(swarmClient.glbBuffer);
-
-                if (hash !== swarmClient.glbHash) {
-                    console.error("GLB hash mismatch! Expected:", swarmClient.glbHash, "Got:", hash);
-                    setStatus("Hash mismatch. Requesting GLB again...");
-                    swarmClient.socketManager.emit('REQUEST_SEEDER', { roomId: roomID });
-                    return;
-                }
-
-                setStatus("GLB verified. Setting up scene...");
-
-                workerRef.current.postMessage({
-                    type: 'SETUP_SCENE',
-                    fileData: swarmClient.glbBuffer.slice(0),
-                    animationIndex: parseInt(swarmClient.animationIndex, 10) || 0,
-                    fps: parseInt(swarmClient.fps, 10) || 30,
-                    totalWidth: parseInt(swarmClient.width, 10),
-                    totalHeight: parseInt(swarmClient.height, 10),
-                    frame: 0
-                });
-
-                // Start taking rendering jobs
-                swarmClient.socketManager.emit('REQUEST_TASK');
-            }
-        });
-
-        swarmClient.on('newTask', (task) => {
-            if (!isSubscribed) return;
-
-            setCurrentFrame(parseInt(task.frame, 10));
-            setChunkAssigned(task.id || `${task.startX}_x_${task.startY}`);
-            setProgress(0); // reset progress
-
-            if (!isSceneReadyRef.current) {
-                pendingChunksRef.current.push(task);
-            } else {
-                workerRef.current.postMessage({
-                    type: 'RENDER_CHUNK',
-                    taskId: task.id,
-                    task: task,
-                    startX: parseInt(task.startX, 10),
-                    startY: parseInt(task.startY, 10),
-                    totalWidth: parseInt(swarmClient.width, 10),
-                    totalHeight: parseInt(swarmClient.height, 10),
-                    frame: parseInt(task.frame, 10),
-                    samples: parseInt(swarmClient.samples, 10),
-                    noiseThreshold: parseFloat(swarmClient.noise),
-                    fps: parseInt(swarmClient.fps, 10),
-                    chunkWidth: chunkW,
-                    chunkHeight: chunkH,
-                });
-            }
-        });
-
-        // 4. Connect to Swarm
-        swarmClient.joinAsWorker(roomID);
-
-        return () => {
-            isSubscribed = false;
-            if (workerRef.current) {
-                workerRef.current.postMessage({ type: 'DISPOSE' });
-                setTimeout(() => {
-                    if (workerRef.current) {
-                        workerRef.current.terminate();
-                        workerRef.current = null;
-                    }
-                }, 100);
-            }
-            if (swarmClient.socketManager.socket) {
-                swarmClient.socketManager.socket.disconnect();
-            }
-        };
-    }, [roomID]);
+            const imgData = new ImageData(flipped, tChunkW, tChunkH);
+            ctx.putImageData(imgData, 0, 0);
+        }
+    });
 
     return (
         <div className='w-[80%] h-2/3 flex justify-between flex-col geist-mono-regular'>

@@ -73,11 +73,6 @@ const ModelCanvas = ({url}) => {
           }
         >
           <Model url={url}/>
-
-          <Environment
-            preset="studio"
-            environmentIntensity={0.5}
-          />
           <OrbitControls/>
         </Suspense>
       </Canvas>

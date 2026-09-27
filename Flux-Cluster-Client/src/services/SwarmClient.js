@@ -122,6 +122,7 @@ class SwarmClient {
         if (this.socketManager.socket && this.socketManager.socket.connected) {
             onConnected();
         } else {
+            this.socketManager.removeAllListeners('connect');
             this.socketManager.on('connect', onConnected);
         }
 
@@ -166,6 +167,7 @@ class SwarmClient {
         console.log("joining the room as master");
         this.socketManager.connect();
         console.log("connected to server")
+        this.socketManager.removeAllListeners('connect');
         this.socketManager.on('connect', () => {
             this._trigger('status', 'Master node connected. Ready to start job.');
             this.socketManager.emit('JOIN_ROOM', { roomId });
@@ -239,7 +241,7 @@ class SwarmClient {
                     taskId: task.id, frame: task.frame,
                     startX: task.startX, startY: task.startY,
                     width: task.totalWidth, height: task.totalHeight,
-                    chunkWidth: 64, chunkHeight: 64
+                    chunkWidth: task.chunkWidth, chunkHeight: task.chunkHeight
                 });
                 this.webrtcManager.renderChannel.send(metadata);
 
@@ -262,7 +264,8 @@ class SwarmClient {
             const metadata = {
                 taskId: task.id, frame: task.frame,
                 startX: task.startX, startY: task.startY,
-                width: task.totalWidth, height: task.totalHeight
+                width: task.totalWidth, height: task.totalHeight,
+                chunkWidth: task.chunkWidth, chunkHeight: task.chunkHeight
             };
             this._trigger('tileReceived', { metadata, pixelBuffer: imageData.buffer });
         }
