@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 
-import { renderChunk } from '../src/render/gpuRenderer.js';
+import { renderChunk, STALL_TIMEOUT_MS } from '../src/render/gpuRenderer.js';
 
 // Node has no requestAnimationFrame, so drive the render loop through a queue
 // that is drained on the macrotask queue. This keeps the tests deterministic and
-// fast while still exercising the real asynchronous frame loop.
+// fast while still exercising the real asynchronous frame loop. Frame listeners
+// run once per drained frame, before the callbacks, so a test can advance a
+// virtual clock or observe state exactly once per animation frame.
 let restoreAnimationFrame = null;
+const frameListeners = new Set();
 
 before(() => {
     let queue = [];
@@ -16,6 +19,8 @@ before(() => {
         setImmediate(() => {
             const pending = queue;
             queue = [];
+            if (pending.length === 0) return;
+            for (const listener of frameListeners) listener();
             for (const entry of pending) entry(0);
         });
         return queue.length;
@@ -26,11 +31,34 @@ before(() => {
 });
 
 after(() => {
+    frameListeners.clear();
     if (restoreAnimationFrame) restoreAnimationFrame();
 });
 
-function createFakeRenderer() {
-    const state = { pixelRatio: null, size: null, readPixelsCalls: [], framebufferAtRead: 'unset' };
+// A wall clock that only moves when an animation frame is driven, so the
+// watchdog tests never depend on real elapsed time or on the host's refresh
+// rate. `now` is handed to renderChunk, `tick` is registered as a frame
+// listener.
+function createVirtualClock(stepMs = 16) {
+    let time = 0;
+    return {
+        stepMs,
+        now: () => time,
+        tick() {
+            time += stepMs;
+        }
+    };
+}
+
+function createFakeRenderer({ pixelRatio = 2, width = 1920, height = 1080 } = {}) {
+    const state = {
+        pixelRatio,
+        size: { width, height, updateStyle: null },
+        readPixelsCalls: [],
+        framebufferAtRead: 'unset',
+        contextLost: false,
+        settingsAtReadback: null
+    };
 
     const gl = {
         FRAMEBUFFER: 0x8d40,
@@ -40,6 +68,8 @@ function createFakeRenderer() {
             state.framebufferAtRead = framebuffer;
         },
         readPixels(x, y, width, height, format, type, pixels) {
+            // The settings seen here are the ones the readback actually covered.
+            state.settingsAtReadback = { pixelRatio: state.pixelRatio, size: { ...state.size } };
             state.readPixelsCalls.push({ x, y, width, height, format, type, length: pixels.length });
             pixels.fill(7);
         },
@@ -56,6 +86,19 @@ function createFakeRenderer() {
         },
         setSize(width, height, updateStyle) {
             state.size = { width, height, updateStyle };
+        },
+        getPixelRatio() {
+            return state.pixelRatio;
+        },
+        getSize(target) {
+            // three writes through Vector2.set(); accept both shapes.
+            if (typeof target.set === 'function') {
+                target.set(state.size.width, state.size.height);
+            } else {
+                target.width = state.size.width;
+                target.height = state.size.height;
+            }
+            return target;
         },
         getContext() {
             return gl;
@@ -88,10 +131,17 @@ function createFakeCamera() {
 // Mirrors how three-gpu-pathtracer actually advances: one renderSample() call
 // renders a single tile of pathTracer.tiles, so a sample only completes once
 // every tile of the grid has been rendered.
-function createFakeTracer({ compileFrames = 0, compileForever = false, neverSample = false } = {}) {
+//
+// `isCompiling` is a polled property: renderChunk reads it exactly once per
+// animation frame, so polling is what clocks the compilation window. Every
+// value the tests do not expect renderChunk to change is deliberately
+// non-default, which makes an unrestored field fail loudly.
+function createFakeTracer({ compileFrames = 0, compileForever = false, neverSample = false, sampleDelayFrames = 0 } = {}) {
     const state = {
         samples: 0,
-        isCompiling: false,
+        compileFramesLeft: compileFrames,
+        compilePolls: 0,
+        sampleDelayLeft: sampleDelayFrames,
         renderSampleCalls: 0,
         resetCalls: 0,
         updateCameraCalls: 0,
@@ -118,7 +168,16 @@ function createFakeTracer({ compileFrames = 0, compileForever = false, neverSamp
             return state.samples;
         },
         get isCompiling() {
-            return state.isCompiling;
+            if (compileForever) {
+                state.compilePolls += 1;
+                return true;
+            }
+            if (state.compileFramesLeft > 0) {
+                state.compilePolls += 1;
+                state.compileFramesLeft -= 1;
+                return true;
+            }
+            return false;
         },
         updateCamera() {
             state.updateCameraCalls += 1;
@@ -127,20 +186,20 @@ function createFakeTracer({ compileFrames = 0, compileForever = false, neverSamp
             state.resetCalls += 1;
             state.samples = 0;
             state.tileProgress = 0;
-            if (compileForever) {
-                state.isCompiling = true;
-                return;
-            }
-            if (compileFrames > 0) {
-                state.isCompiling = true;
-                setTimeout(() => {
-                    state.isCompiling = false;
-                }, 0);
-            }
+            state.compilePolls = 0;
+            state.compileFramesLeft = compileForever ? Infinity : compileFrames;
+            state.sampleDelayLeft = sampleDelayFrames;
         },
         renderSample() {
             state.renderSampleCalls += 1;
-            if (state.isCompiling || neverSample) return;
+            if (state.compileFramesLeft > 0 || neverSample) return;
+            // Warm-up frames: a real tracer can spend a call or two after a
+            // recompile before the first sample lands, and those frames must not
+            // inherit a stall deadline that expired during compilation.
+            if (state.sampleDelayLeft > 0) {
+                state.sampleDelayLeft -= 1;
+                return;
+            }
             state.tileProgress += 1;
             if (state.tileProgress >= this.tiles.x * this.tiles.y) {
                 state.tileProgress = 0;
@@ -150,7 +209,69 @@ function createFakeTracer({ compileFrames = 0, compileForever = false, neverSamp
     };
 }
 
-function createRun({ samples = 8, startX = 32, startY = 64, width = 64, height = 64, totalWidth = 192, totalHeight = 192, tracer, renderer, camera } = {}) {
+// The shared settings renderChunk borrows for the duration of a tile, captured
+// while the tile is still rendering (progress is reported before the cleanup
+// funnel runs).
+function snapshotRenderConfig(renderer, tracer) {
+    return {
+        pixelRatio: renderer.state.pixelRatio,
+        rendererSize: { width: renderer.state.size.width, height: renderer.state.size.height },
+        tiles: { x: tracer.tiles.x, y: tracer.tiles.y },
+        rasterizeScene: tracer.rasterizeScene,
+        renderToCanvas: tracer.renderToCanvas,
+        renderDelay: tracer.renderDelay,
+        fadeDuration: tracer.fadeDuration,
+        minSamples: tracer.minSamples
+    };
+}
+
+// The fake tracer and renderer start from non-default values; this is the state
+// every exit path has to hand back.
+function assertSharedStateRestored(renderer, tracer, { pixelRatio = 2, width = 1920, height = 1080 } = {}) {
+    assert.equal(renderer.state.pixelRatio, pixelRatio, 'the renderer pixel ratio must be restored');
+    assert.deepEqual(
+        { width: renderer.state.size.width, height: renderer.state.size.height },
+        { width, height },
+        'the renderer size must be restored'
+    );
+    assert.equal(tracer.rasterizeScene, true, 'rasterizeScene must be restored');
+    assert.equal(tracer.renderToCanvas, false, 'renderToCanvas must be restored');
+    assert.equal(tracer.renderDelay, 100, 'renderDelay must be restored');
+    assert.equal(tracer.fadeDuration, 500, 'fadeDuration must be restored');
+    assert.equal(tracer.minSamples, 5, 'minSamples must be restored');
+    assert.deepEqual({ x: tracer.tiles.x, y: tracer.tiles.y }, { x: 3, y: 3 }, 'tiles must be restored');
+}
+
+// Drives a tracer that never produces a sample until the watchdog gives up,
+// with a virtual clock, so "stalled for a second" costs a few dozen animation
+// frames instead of a real sleep and cannot depend on the host's timers.
+async function runStalledRender(stepMs) {
+    const renderer = createFakeRenderer();
+    const camera = createFakeCamera();
+    const tracer = createFakeTracer({ neverSample: true });
+    const clock = createVirtualClock(stepMs);
+    const stallTimeoutMs = 1000;
+    frameListeners.add(clock.tick);
+
+    try {
+        const promise = renderChunk(
+            renderer,
+            tracer,
+            camera,
+            0, 0, 64, 64, 192, 192, 8,
+            undefined,
+            undefined,
+            { stallTimeoutMs, now: clock.now }
+        );
+        await assert.rejects(promise, /stopped accumulating/);
+    } finally {
+        frameListeners.delete(clock.tick);
+    }
+
+    return { clock, camera, renderer, tracer, stallTimeoutMs };
+}
+
+function createRun({ samples = 8, startX = 32, startY = 64, width = 64, height = 64, totalWidth = 192, totalHeight = 192, tracer, renderer, camera, signal, options } = {}) {
     const progress = [];
     const promise = renderChunk(
         renderer,
@@ -163,8 +284,9 @@ function createRun({ samples = 8, startX = 32, startY = 64, width = 64, height =
         totalWidth,
         totalHeight,
         samples,
-        (data) => progress.push({ ...data }),
-        undefined
+        (data) => progress.push({ ...data, config: snapshotRenderConfig(renderer, tracer) }),
+        signal,
+        options
     );
     return { promise, progress };
 }
@@ -175,17 +297,22 @@ describe('renderChunk', () => {
         const camera = createFakeCamera();
         const tracer = createFakeTracer();
 
-        const { promise } = createRun({ renderer, camera, tracer, samples: 4 });
+        const { promise, progress } = createRun({ renderer, camera, tracer, samples: 4 });
         await promise;
 
-        assert.equal(renderer.state.pixelRatio, 1, 'pixel ratio must be 1 so readPixels covers the whole tile');
-        assert.deepEqual(renderer.state.size, { width: 64, height: 64, updateStyle: false });
-        assert.deepEqual({ x: tracer.tiles.x, y: tracer.tiles.y }, { x: 1, y: 1 });
-        assert.equal(tracer.rasterizeScene, false, 'the rasterised fallback must not overwrite the tile');
-        assert.equal(tracer.renderToCanvas, true, 'the tracer must composite its target to the canvas we read back');
-        assert.equal(tracer.renderDelay, 0);
-        assert.equal(tracer.fadeDuration, 0);
-        assert.equal(tracer.minSamples, 1);
+        const config = progress[0].config;
+        assert.equal(config.pixelRatio, 1, 'pixel ratio must be 1 so readPixels covers the whole tile');
+        assert.deepEqual(
+            { width: config.rendererSize.width, height: config.rendererSize.height },
+            { width: 64, height: 64 },
+            'the drawing buffer must match the tile exactly'
+        );
+        assert.deepEqual(config.tiles, { x: 1, y: 1 });
+        assert.equal(config.rasterizeScene, false, 'the rasterised fallback must not overwrite the tile');
+        assert.equal(config.renderToCanvas, true, 'the tracer must composite its target to the canvas we read back');
+        assert.equal(config.renderDelay, 0);
+        assert.equal(config.fadeDuration, 0);
+        assert.equal(config.minSamples, 1);
         assert.equal(tracer.state.resetCalls, 1);
     });
 
@@ -247,7 +374,82 @@ describe('renderChunk', () => {
         await promise;
 
         assert.equal(tracer.state.samples, samples);
+        assert.equal(tracer.state.compilePolls, 3, 'the tracer must have been polled while compiling');
         assert.equal(tracer.state.renderSampleCalls, samples, 'renderSample() must be skipped while compiling');
+    });
+
+    // Regression test for the blocking review comment: renderChunk() skips
+    // renderSample() while pathTracer.isCompiling, so an animation-frame stall
+    // budget would count those frames as a hang and reject a perfectly healthy
+    // render. The budget is wall-clock and compilation frames are excluded from
+    // the accounting entirely, which this proves by running compilation for far
+    // longer than the stall timeout.
+    it('does not reject when compilation outlasts the stall timeout', async () => {
+        const renderer = createFakeRenderer();
+        const camera = createFakeCamera();
+        // sampleDelayFrames keeps the tracer quiet for two calls after the
+        // recompile, so a deadline that the compilation left stale would be
+        // judged on the first frames after it ends.
+        const tracer = createFakeTracer({ compileFrames: 1250, sampleDelayFrames: 2 });
+        const clock = createVirtualClock(16);
+        const stallTimeoutMs = 500;
+
+        const samplesDuringCompile = [];
+        let compileEndsAt = null;
+        const observe = () => {
+            if (tracer.state.compileFramesLeft > 0) {
+                samplesDuringCompile.push(tracer.state.samples);
+            } else if (compileEndsAt === null) {
+                compileEndsAt = clock.now();
+            }
+        };
+        frameListeners.add(clock.tick);
+        frameListeners.add(observe);
+
+        try {
+            const samples = 6;
+            const { promise, progress } = createRun({
+                renderer,
+                camera,
+                tracer,
+                samples,
+                options: { stallTimeoutMs, now: clock.now }
+            });
+            const pixels = await promise;
+
+            assert.ok(compileEndsAt !== null, 'the compilation window must actually end');
+            assert.ok(
+                compileEndsAt > stallTimeoutMs,
+                `compilation must outlive the ${stallTimeoutMs}ms budget (ended at ${compileEndsAt}ms)`
+            );
+            assert.ok(
+                samplesDuringCompile.length > 1000,
+                'the test must observe a compilation spanning many frames'
+            );
+            assert.ok(
+                samplesDuringCompile.every((value) => value === 0),
+                'samples must not move while the tracer is compiling'
+            );
+            assert.equal(tracer.state.samples, samples, 'sampling must resume after compilation');
+            assert.equal(
+                tracer.state.renderSampleCalls,
+                samples + 2,
+                'renderSample() must be skipped while compiling, then warm up before the first sample'
+            );
+            assert.equal(
+                progress.length,
+                tracer.state.renderSampleCalls,
+                'only frames that ran renderSample() may report progress'
+            );
+            assert.equal(progress[progress.length - 1].samples, samples, 'progress must reach the target sample count');
+            for (let i = 1; i < progress.length; i++) {
+                assert.ok(progress[i].samples >= progress[i - 1].samples, 'progress must never regress');
+            }
+            assert.equal(pixels.length, 64 * 64 * 4);
+        } finally {
+            frameListeners.delete(clock.tick);
+            frameListeners.delete(observe);
+        }
     });
 
     it('reads the composited tile back from the default framebuffer', async () => {
@@ -262,6 +464,12 @@ describe('renderChunk', () => {
         assert.deepEqual(renderer.state.readPixelsCalls, [
             { x: 0, y: 0, width: 8, height: 4, format: renderer.gl.RGBA, type: renderer.gl.UNSIGNED_BYTE, length: 8 * 4 * 4 }
         ]);
+        assert.deepEqual(
+            { width: renderer.state.settingsAtReadback.size.width, height: renderer.state.settingsAtReadback.size.height },
+            { width: 8, height: 4 },
+            'the readback must cover the whole tile, not a stale drawing buffer'
+        );
+        assert.equal(renderer.state.settingsAtReadback.pixelRatio, 1);
         assert.equal(pixels[0], 7);
     });
 
@@ -295,7 +503,26 @@ describe('renderChunk', () => {
         assert.equal(tracer.state.samples, 1);
     });
 
-    it('rejects and restores the camera when the render is aborted', async () => {
+    it('restores the shared renderer and tracer state after a successful render', async () => {
+        const renderer = createFakeRenderer({ pixelRatio: 3, width: 800, height: 600 });
+        const camera = createFakeCamera();
+        const tracer = createFakeTracer();
+
+        const { promise, progress } = createRun({ renderer, camera, tracer, samples: 4 });
+        await promise;
+
+        const during = progress[progress.length - 1].config;
+        assert.equal(during.pixelRatio, 1, 'the tile must render with the borrowed settings');
+        assert.deepEqual({ width: during.rendererSize.width, height: during.rendererSize.height }, { width: 64, height: 64 });
+        assert.deepEqual(during.tiles, { x: 1, y: 1 });
+        assert.equal(during.rasterizeScene, false);
+        assert.equal(during.renderToCanvas, true);
+
+        assertSharedStateRestored(renderer, tracer, { pixelRatio: 3, width: 800, height: 600 });
+        assert.equal(camera.viewOffset, null, 'the tile view offset must not leak into the next tile');
+    });
+
+    it('rejects and restores the shared state when the render is aborted', async () => {
         const renderer = createFakeRenderer();
         const camera = createFakeCamera();
         const tracer = createFakeTracer();
@@ -307,9 +534,10 @@ describe('renderChunk', () => {
         );
         await assert.rejects(promise, /Render aborted/);
         assert.equal(camera.viewOffsetCleared, true);
+        assertSharedStateRestored(renderer, tracer);
     });
 
-    it('rejects when the WebGL context is lost', async () => {
+    it('rejects and restores the shared state when the WebGL context is lost', async () => {
         const renderer = createFakeRenderer();
         renderer.state.contextLost = true;
         const camera = createFakeCamera();
@@ -318,16 +546,66 @@ describe('renderChunk', () => {
         const promise = renderChunk(renderer, tracer, camera, 0, 0, 64, 64, 192, 192, 8, undefined, undefined);
         await assert.rejects(promise, /WebGL context lost/);
         assert.equal(camera.viewOffsetCleared, true);
+        assertSharedStateRestored(renderer, tracer);
     });
 
-    it('rejects instead of hanging when the path tracer never accumulates', async () => {
-        const renderer = createFakeRenderer();
-        const camera = createFakeCamera();
-        const tracer = createFakeTracer({ neverSample: true });
+    it('rejects once the wall-clock stall timeout elapses without new samples', async () => {
+        const stepMs = 16;
+        const { clock, camera, renderer, tracer, stallTimeoutMs } = await runStalledRender(stepMs);
 
-        const promise = renderChunk(renderer, tracer, camera, 0, 0, 64, 64, 192, 192, 8, undefined, undefined);
-        await assert.rejects(promise, /stopped accumulating/);
+        assert.ok(
+            clock.now() > stallTimeoutMs,
+            `the watchdog must wait out the full ${stallTimeoutMs}ms budget (stopped at ${clock.now()}ms)`
+        );
+        assert.ok(
+            clock.now() <= stallTimeoutMs + 2 * stepMs,
+            'and must reject as soon as that budget is exceeded'
+        );
+        assert.equal(
+            tracer.state.renderSampleCalls,
+            Math.floor(stallTimeoutMs / stepMs) + 1,
+            'one fruitless call per frame until the budget ran out'
+        );
         assert.equal(camera.viewOffsetCleared, true);
+        assertSharedStateRestored(renderer, tracer);
+    });
+
+    // The old budget counted animation frames, so the same setting meant 40 s at
+    // 30 Hz and 8 s at 144 Hz. Running the identical stall over two frame rates
+    // must therefore spend the same elapsed time but a different number of
+    // frames.
+    it('measures the stall budget in elapsed time rather than animation frames', async () => {
+        const fastFrames = await runStalledRender(16);
+        const slowFrames = await runStalledRender(100);
+
+        const { stallTimeoutMs } = fastFrames;
+        assert.ok(
+            fastFrames.clock.now() > stallTimeoutMs && fastFrames.clock.now() <= stallTimeoutMs + 2 * 16,
+            `16ms frames must reject at ${stallTimeoutMs}ms (stopped at ${fastFrames.clock.now()}ms)`
+        );
+        assert.ok(
+            slowFrames.clock.now() > stallTimeoutMs && slowFrames.clock.now() <= stallTimeoutMs + 2 * 100,
+            `100ms frames must reject at ${stallTimeoutMs}ms (stopped at ${slowFrames.clock.now()}ms)`
+        );
+        assert.notEqual(
+            fastFrames.tracer.state.renderSampleCalls,
+            slowFrames.tracer.state.renderSampleCalls,
+            'the same elapsed budget must buy a different number of frames'
+        );
+        assert.equal(
+            fastFrames.tracer.state.renderSampleCalls - 1,
+            Math.floor(stallTimeoutMs / 16),
+            'the fast frame rate must have produced more attempts within the budget'
+        );
+        assert.equal(slowFrames.tracer.state.renderSampleCalls - 1, Math.floor(stallTimeoutMs / 100));
+    });
+
+    it('uses a wall-clock stall budget rather than a frame count', () => {
+        // Guards against regressing to MAX_STALLED_FRAMES-style accounting,
+        // where the same budget meant a different real duration at 30/144 Hz.
+        assert.equal(typeof STALL_TIMEOUT_MS, 'number');
+        assert.ok(STALL_TIMEOUT_MS > 0);
+        assert.ok(STALL_TIMEOUT_MS <= 60000, 'a healthy render must never be this slow to add a sample');
     });
 
     it('stops requesting animation frames once the render is done', async () => {
@@ -360,7 +638,7 @@ describe('renderChunk', () => {
         assert.equal(tracer.state.renderSampleCalls, callsAtAbort, 'an aborted render must not keep working');
     });
 
-    it('clears the camera offset when setup throws after framing the tile', async () => {
+    it('clears the camera and restores shared state when setup throws after framing the tile', async () => {
         const renderer = createFakeRenderer();
         const camera = createFakeCamera();
         const tracer = createFakeTracer();
@@ -375,5 +653,6 @@ describe('renderChunk', () => {
             /context lost during reset/
         );
         assert.equal(camera.viewOffsetCleared, true, 'a failed setup must not leave the camera offset');
+        assertSharedStateRestored(renderer, tracer);
     });
 });
