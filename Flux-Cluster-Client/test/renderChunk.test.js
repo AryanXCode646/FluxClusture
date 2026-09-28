@@ -50,25 +50,49 @@ function createVirtualClock(stepMs = 16) {
     };
 }
 
-function createFakeRenderer({ pixelRatio = 2, width = 1920, height = 1080 } = {}) {
+function createFakeRenderer({
+    pixelRatio = 2,
+    width = 1920,
+    height = 1080,
+    renderTarget = { isRenderTarget: true, id: 'test-rt' },
+    viewport = { x: 10, y: 20, width: 800, height: 600 },
+    scissor = { x: 5, y: 15, width: 400, height: 300 },
+    scissorTest = true,
+    autoClear = true,
+    initialFramebuffer = 0xbeef
+} = {}) {
     const state = {
         pixelRatio,
         size: { width, height, updateStyle: null },
+        renderTarget,
+        viewport: { ...viewport },
+        scissor: { ...scissor },
+        scissorTest,
+        autoClear,
         readPixelsCalls: [],
         framebufferAtRead: 'unset',
+        currentGlFramebuffer: initialFramebuffer,
         contextLost: false,
         settingsAtReadback: null
     };
 
     const gl = {
         FRAMEBUFFER: 0x8d40,
+        FRAMEBUFFER_BINDING: 0x85b5,
         RGBA: 0x1908,
         UNSIGNED_BYTE: 0x1401,
         bindFramebuffer(target, framebuffer) {
-            state.framebufferAtRead = framebuffer;
+            state.currentGlFramebuffer = framebuffer;
+        },
+        getParameter(pname) {
+            if (pname === 0x85b5) {
+                return state.currentGlFramebuffer;
+            }
+            return null;
         },
         readPixels(x, y, width, height, format, type, pixels) {
             // The settings seen here are the ones the readback actually covered.
+            state.framebufferAtRead = state.currentGlFramebuffer;
             state.settingsAtReadback = { pixelRatio: state.pixelRatio, size: { ...state.size } };
             state.readPixelsCalls.push({ x, y, width, height, format, type, length: pixels.length });
             pixels.fill(7);
@@ -81,6 +105,7 @@ function createFakeRenderer({ pixelRatio = 2, width = 1920, height = 1080 } = {}
     return {
         state,
         gl,
+        autoClear,
         setPixelRatio(ratio) {
             state.pixelRatio = ratio;
         },
@@ -99,6 +124,48 @@ function createFakeRenderer({ pixelRatio = 2, width = 1920, height = 1080 } = {}
                 target.height = state.size.height;
             }
             return target;
+        },
+        getRenderTarget() {
+            return state.renderTarget;
+        },
+        setRenderTarget(rt) {
+            state.renderTarget = rt;
+        },
+        getViewport(target) {
+            if (typeof target.set === 'function') {
+                target.set(state.viewport.x, state.viewport.y, state.viewport.width, state.viewport.height);
+            } else {
+                Object.assign(target, state.viewport);
+            }
+            return target;
+        },
+        setViewport(x, y, width, height) {
+            if (typeof x === 'object' && x !== null) {
+                state.viewport = { ...x };
+            } else {
+                state.viewport = { x, y, width, height };
+            }
+        },
+        getScissor(target) {
+            if (typeof target.set === 'function') {
+                target.set(state.scissor.x, state.scissor.y, state.scissor.width, state.scissor.height);
+            } else {
+                Object.assign(target, state.scissor);
+            }
+            return target;
+        },
+        setScissor(x, y, width, height) {
+            if (typeof x === 'object' && x !== null) {
+                state.scissor = { ...x };
+            } else {
+                state.scissor = { x, y, width, height };
+            }
+        },
+        getScissorTest() {
+            return state.scissorTest;
+        },
+        setScissorTest(enabled) {
+            state.scissorTest = enabled;
         },
         getContext() {
             return gl;
@@ -227,13 +294,27 @@ function snapshotRenderConfig(renderer, tracer) {
 
 // The fake tracer and renderer start from non-default values; this is the state
 // every exit path has to hand back.
-function assertSharedStateRestored(renderer, tracer, { pixelRatio = 2, width = 1920, height = 1080 } = {}) {
+function assertSharedStateRestored(renderer, tracer, {
+    pixelRatio = 2,
+    width = 1920,
+    height = 1080,
+    renderTarget = { isRenderTarget: true, id: 'test-rt' },
+    viewport = { x: 10, y: 20, width: 800, height: 600 },
+    scissor = { x: 5, y: 15, width: 400, height: 300 },
+    scissorTest = true,
+    initialFramebuffer = 0xbeef
+} = {}) {
     assert.equal(renderer.state.pixelRatio, pixelRatio, 'the renderer pixel ratio must be restored');
     assert.deepEqual(
         { width: renderer.state.size.width, height: renderer.state.size.height },
         { width, height },
         'the renderer size must be restored'
     );
+    assert.deepEqual(renderer.state.renderTarget, renderTarget, 'renderTarget must be restored');
+    assert.deepEqual(renderer.state.viewport, viewport, 'viewport must be restored');
+    assert.deepEqual(renderer.state.scissor, scissor, 'scissor must be restored');
+    assert.equal(renderer.state.scissorTest, scissorTest, 'scissorTest must be restored');
+    assert.equal(renderer.state.currentGlFramebuffer, initialFramebuffer, 'GL framebuffer must be restored');
     assert.equal(tracer.rasterizeScene, true, 'rasterizeScene must be restored');
     assert.equal(tracer.renderToCanvas, false, 'renderToCanvas must be restored');
     assert.equal(tracer.renderDelay, 100, 'renderDelay must be restored');
@@ -655,4 +736,140 @@ describe('renderChunk', () => {
         assert.equal(camera.viewOffsetCleared, true, 'a failed setup must not leave the camera offset');
         assertSharedStateRestored(renderer, tracer);
     });
+
+    it('restores custom render target, viewport, scissor, scissorTest, and GL framebuffer', async () => {
+        const customRt = { isRenderTarget: true, name: 'my-custom-rt' };
+        const customVp = { x: 25, y: 35, width: 640, height: 480 };
+        const customSc = { x: 30, y: 40, width: 320, height: 240 };
+        const renderer = createFakeRenderer({
+            renderTarget: customRt,
+            viewport: customVp,
+            scissor: customSc,
+            scissorTest: true,
+            initialFramebuffer: 0x9999
+        });
+        const camera = createFakeCamera();
+        const tracer = createFakeTracer();
+
+        const { promise } = createRun({ renderer, camera, tracer, samples: 2 });
+        await promise;
+
+        assert.equal(renderer.getRenderTarget(), customRt, 'render target must be restored to custom target');
+        assert.deepEqual(renderer.state.viewport, customVp, 'viewport must be restored to custom viewport');
+        assert.deepEqual(renderer.state.scissor, customSc, 'scissor must be restored to custom scissor');
+        assert.equal(renderer.getScissorTest(), true, 'scissor test must be restored to true');
+        assert.equal(renderer.state.currentGlFramebuffer, 0x9999, 'GL framebuffer must be restored to previous binding');
+    });
+
+    describe('abort timing cases', () => {
+        it('aborts before render starts without scheduling animation frames', async () => {
+            const renderer = createFakeRenderer();
+            const camera = createFakeCamera();
+            const tracer = createFakeTracer();
+            const abortController = new AbortController();
+            abortController.abort(); // already aborted
+
+            const promise = renderChunk(
+                renderer, tracer, camera, 0, 0, 64, 64, 128, 128, 4, undefined, abortController.signal
+            );
+            await assert.rejects(promise, /Render aborted/);
+            assert.equal(tracer.state.renderSampleCalls, 0, 'no frames or samples should run');
+            assertSharedStateRestored(renderer, tracer);
+        });
+
+        it('aborts during rendering while waiting for next frame and settles immediately', async () => {
+            const renderer = createFakeRenderer();
+            const camera = createFakeCamera();
+            const tracer = createFakeTracer();
+            const abortController = new AbortController();
+
+            let progressCount = 0;
+            const promise = renderChunk(
+                renderer, tracer, camera, 0, 0, 64, 64, 128, 128, 10,
+                () => {
+                    progressCount += 1;
+                    if (progressCount === 2) {
+                        abortController.abort();
+                    }
+                },
+                abortController.signal
+            );
+
+            await assert.rejects(promise, /Render aborted/);
+            assert.equal(progressCount, 2, 'progress was interrupted at sample 2');
+            assertSharedStateRestored(renderer, tracer);
+        });
+
+        it('handles repeated abort calls and abort after completion harmlessly', async () => {
+            const renderer = createFakeRenderer();
+            const camera = createFakeCamera();
+            const tracer = createFakeTracer();
+            const abortController = new AbortController();
+
+            const { promise } = createRun({ renderer, camera, tracer, samples: 2, signal: abortController.signal });
+            const pixels = await promise;
+            assert.equal(pixels.length, 64 * 64 * 4);
+
+            // Abort after completion
+            abortController.abort();
+            abortController.abort(); // repeated
+
+            assertSharedStateRestored(renderer, tracer);
+        });
+    });
+
+    describe('chunk coordinates and dimensions', () => {
+        it('handles first, middle, and final chunks correctly with correct buffer sizes', async () => {
+            const renderer = createFakeRenderer();
+            const camera = createFakeCamera();
+            const tracer = createFakeTracer();
+
+            // Total image: 192x192, chunks: 64x64
+            const configs = [
+                { startX: 0, startY: 0, w: 64, h: 64, desc: 'first chunk' },
+                { startX: 64, startY: 64, w: 64, h: 64, desc: 'middle chunk' },
+                { startX: 128, startY: 128, w: 64, h: 64, desc: 'final chunk' }
+            ];
+
+            for (const cfg of configs) {
+                const { promise } = createRun({
+                    renderer, camera, tracer,
+                    startX: cfg.startX, startY: cfg.startY,
+                    width: cfg.w, height: cfg.h,
+                    totalWidth: 192, totalHeight: 192,
+                    samples: 1
+                });
+                const pixels = await promise;
+                assert.equal(pixels.length, cfg.w * cfg.h * 4, `${cfg.desc} pixel length must be width * height * 4`);
+                const lastCall = renderer.state.readPixelsCalls[renderer.state.readPixelsCalls.length - 1];
+                assert.equal(lastCall.width, cfg.w);
+                assert.equal(lastCall.height, cfg.h);
+            }
+        });
+
+        it('handles non-square chunks and dimensions not divisible by chunk size', async () => {
+            const renderer = createFakeRenderer();
+            const camera = createFakeCamera();
+            const tracer = createFakeTracer();
+
+            // Non-square chunk (120x80) in a 250x175 image
+            const { promise } = createRun({
+                renderer, camera, tracer,
+                startX: 120, startY: 80,
+                width: 120, height: 80,
+                totalWidth: 250, totalHeight: 175,
+                samples: 1
+            });
+            const pixels = await promise;
+
+            assert.equal(pixels.length, 120 * 80 * 4);
+            const lastCall = renderer.state.readPixelsCalls[renderer.state.readPixelsCalls.length - 1];
+            assert.equal(lastCall.width, 120);
+            assert.equal(lastCall.height, 80);
+            assert.deepEqual(camera.viewOffsetHistory[camera.viewOffsetHistory.length - 1], {
+                fullWidth: 250, fullHeight: 175, x: 120, y: 80, width: 120, height: 80
+            });
+        });
+    });
 });
+
