@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>WebGL Path Tracer Regression Test Fixture</title>
+</head>
+<body>
+    <div id="container"></div>
+    <script type="module">
+        import * as THREE from 'three';
+        import { WebGLPathTracer } from 'three-gpu-pathtracer';
+        import { renderChunk } from '/src/render/gpuRenderer.js';
+        import { worldBackgroundColor, ensurePathTracerEnvironment } from '/src/render/upgradeLights.js';
+
+        window.__runRegressionTest = async function({ testMode = 'standard', width = 64, height = 64, samples = 3 } = {}) {
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            document.body.appendChild(canvas);
+
+            const renderer = new THREE.WebGLRenderer({
+                canvas,
+                antialias: false,
+                alpha: false,
+                preserveDrawingBuffer: true
+            });
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.0;
+
+            const pathTracer = new WebGLPathTracer(renderer);
+
+            const scene = new THREE.Scene();
+            if (testMode === 'pure-white-env') {
+                scene.background = worldBackgroundColor(0xffffff);
+            } else {
+                scene.background = worldBackgroundColor(0x112233);
+            }
+
+            // Create a diffuse sphere
+            const sphereGeo = new THREE.SphereGeometry(1, 32, 32);
+            const sphereMat = new THREE.MeshStandardMaterial({
+                color: 0xdd2222,
+                roughness: 0.3,
+                metalness: 0.1
+            });
+            const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+            scene.add(sphere);
+
+            // Add lighting
+            const light = new THREE.DirectionalLight(0xffffff, 4);
+            light.position.set(3, 3, 3);
+            scene.add(light);
+
+            const camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 100);
+            camera.position.set(0, 0, 3);
+            camera.lookAt(0, 0, 0);
+
+            pathTracer.setScene(scene, camera);
+            ensurePathTracerEnvironment(pathTracer);
+
+            const pixels = await renderChunk(
+                renderer,
+                pathTracer,
+                camera,
+                0, 0,
+                width, height,
+                width, height,
+                samples
+            );
+
+            // Compute statistics on the returned pixels
+            let minVal = 255;
+            let maxVal = 0;
+            let sum = 0;
+            let allBlack = true;
+            let allWhite = true;
+            const firstPixel = [pixels[0], pixels[1], pixels[2], pixels[3]];
+            let isUniform = true;
+
+            for (let i = 0; i < pixels.length; i += 4) {
+                const r = pixels[i];
+                const g = pixels[i + 1];
+                const b = pixels[i + 2];
+                const a = pixels[i + 3];
+
+                if (r !== 0 || g !== 0 || b !== 0) allBlack = false;
+                if (r !== 255 || g !== 255 || b !== 255) allWhite = false;
+
+                if (r !== firstPixel[0] || g !== firstPixel[1] || b !== firstPixel[2] || a !== firstPixel[3]) {
+                    isUniform = false;
+                }
+
+                const brightness = (r + g + b) / 3;
+                if (brightness < minVal) minVal = brightness;
+                if (brightness > maxVal) maxVal = brightness;
+                sum += brightness;
+            }
+
+            const totalPixels = width * height;
+            const mean = sum / totalPixels;
+
+            let varianceSum = 0;
+            for (let i = 0; i < pixels.length; i += 4) {
+                const brightness = (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
+                varianceSum += (brightness - mean) ** 2;
+            }
+            const variance = varianceSum / totalPixels;
+
+            const result = {
+                pixelCount: pixels.length,
+                expectedLength: width * height * 4,
+                allBlack,
+                allWhite,
+                isUniform,
+                minVal,
+                maxVal,
+                variance,
+                tracerSamples: pathTracer.samples,
+                tilesX: pathTracer.tiles?.x,
+                tilesY: pathTracer.tiles?.y
+            };
+
+            // Cleanup
+            pathTracer.dispose();
+            renderer.dispose();
+            renderer.forceContextLoss();
+            canvas.remove();
+
+            return result;
+        };
+    </script>
+</body>
+</html>

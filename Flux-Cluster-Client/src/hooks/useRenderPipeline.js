@@ -3,8 +3,9 @@ import * as THREE from 'three';
 import { WebGLPathTracer } from 'three-gpu-pathtracer';
 import { swarmClient } from '../services/SwarmClient';
 import { loadGLB } from '../render/modelLoader';
-import { upgradeSceneLights, worldBackgroundColor } from '../render/upgradeLights';
+import { upgradeSceneLights, worldBackgroundColor, ensurePathTracerEnvironment } from '../render/upgradeLights';
 import { renderChunk } from '../render/gpuRenderer';
+import { RenderTaskQueue } from '../render/taskQueue';
 import { generateFileHash } from '../utils/helper';
 
 function syncCamera(scene, renderCamera, width, height) {
@@ -54,7 +55,7 @@ export function useRenderPipeline({
     onSettingsReceived
 }) {
     const isSceneReadyRef = useRef(false);
-    const pendingChunksRef = useRef([]);
+    const taskQueueRef = useRef(null);
 
     const rendererRef = useRef(null);
     const pathTracerRef = useRef(null);
@@ -69,6 +70,10 @@ export function useRenderPipeline({
 
         let isSubscribed = true;
         const abortController = new AbortController();
+        const taskQueue = new RenderTaskQueue();
+        taskQueueRef.current = taskQueue;
+        taskQueue.pause();
+
         const chunkW = 128;
         const chunkH = 128;
 
@@ -81,8 +86,8 @@ export function useRenderPipeline({
         pathTracerRef.current = new WebGLPathTracer(rendererRef.current);
         cameraRef.current = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
 
-        const processTask = async (task) => {
-            if (!isSubscribed) return;
+        const processTask = async (task, taskSignal) => {
+            if (!isSubscribed || taskSignal?.aborted || abortController.signal.aborted) return;
             console.log(`[useRenderPipeline] 🚀 Starting processTask for chunk:`, task.id || `${task.startX}_x_${task.startY}`);
             try {
                 const fps = role === 'master' ? (config?.fps || 30) : (parseInt(swarmClient.fps, 10) || 30);
@@ -97,6 +102,7 @@ export function useRenderPipeline({
                     }
                     syncCamera(sceneRef.current, cameraRef.current, width, height);
                     pathTracerRef.current.setScene(sceneRef.current, cameraRef.current);
+                    ensurePathTracerEnvironment(pathTracerRef.current);
                     currentRenderedFrameRef.current = task.frame;
                 }
 
@@ -104,6 +110,7 @@ export function useRenderPipeline({
                 const tChunkH = parseInt(task.chunkHeight, 10) || chunkH;
 
                 console.log(`[useRenderPipeline] ⚙️ Calling gpuRenderer renderChunk for ${tChunkW}x${tChunkH} pixels...`);
+                const effectiveSignal = taskSignal || abortController.signal;
                 const pixels = await renderChunk(
                     rendererRef.current,
                     pathTracerRef.current,
@@ -116,7 +123,7 @@ export function useRenderPipeline({
                     height,
                     samples,
                     (progressData) => {
-                        if (isSubscribed) {
+                        if (isSubscribed && !effectiveSignal.aborted) {
                             if (role === 'worker' && progressData.maxSamples > 0 && setProgress) {
                                 setProgress(progressData.samples / progressData.maxSamples);
                             }
@@ -125,11 +132,11 @@ export function useRenderPipeline({
                             }
                         }
                     },
-                    abortController.signal
+                    effectiveSignal
                 );
 
                 console.log(`[useRenderPipeline] ✅ renderChunk completed for ${task.id || `${task.startX}_x_${task.startY}`}. Submitting tile...`);
-                if (isSubscribed) {
+                if (isSubscribed && !effectiveSignal.aborted && pixels) {
                     if (role === 'worker' && onTileReceived) {
                         onTileReceived({ chunkWidth: tChunkW, chunkHeight: tChunkH }, pixels);
                     }
@@ -182,12 +189,11 @@ export function useRenderPipeline({
                 console.log("[useRenderPipeline] 🎥 Syncing camera and passing scene to PathTracer...");
                 syncCamera(sceneRef.current, cameraRef.current, width, height);
                 pathTracerRef.current.setScene(sceneRef.current, cameraRef.current);
+                ensurePathTracerEnvironment(pathTracerRef.current);
                 isSceneReadyRef.current = true;
-                console.log("[useRenderPipeline] 🎉 Scene setup complete! Ready to process chunks.");
+                console.log("[useRenderPipeline] 🎉 Scene setup complete! Resuming render task queue.");
 
-                console.log(`[useRenderPipeline] 📝 Processing ${pendingChunksRef.current.length} pending chunks...`);
-                pendingChunksRef.current.forEach(task => processTask(task));
-                pendingChunksRef.current = [];
+                taskQueue.resume();
 
                 if (role === 'worker') {
                     console.log("[useRenderPipeline] 🙋 Worker requesting initial tasks...");
@@ -225,12 +231,7 @@ export function useRenderPipeline({
                 };
             }
 
-            if (!isSceneReadyRef.current) {
-                console.log(`[useRenderPipeline] ⏳ Scene not ready yet. Queuing chunk ${enrichedTask.id || `${enrichedTask.startX}_x_${enrichedTask.startY}`}`);
-                pendingChunksRef.current.push(enrichedTask);
-            } else {
-                processTask(enrichedTask);
-            }
+            taskQueue.enqueue(enrichedTask, processTask);
         });
 
         if (role === 'master') {
@@ -336,6 +337,11 @@ export function useRenderPipeline({
         return () => {
             isSubscribed = false;
             abortController.abort();
+
+            if (taskQueueRef.current) {
+                taskQueueRef.current.dispose();
+                taskQueueRef.current = null;
+            }
 
             if (pathTracerRef.current) {
                 pathTracerRef.current.dispose();

@@ -78,29 +78,17 @@ export function upgradeSceneLights(scene) {
     return globalIllumination;
 }
 
-// Colour a pure white world background is nudged to, see worldBackgroundColor.
-const WORKAROUND_WHITE = 0xfefefe;
-
 /**
- * Builds the solid background colour for a world GI value.
- *
- * three-gpu-pathtracer keeps a solid scene background in a gradient equirect
- * texture that is created with a white top colour and is only rebuilt when the
- * requested colour differs from the cached one. Because the cached colour is
- * already white, a pure white background is never written into the texture and
- * the tracer resolves the environment to black. Nudging the colour off pure
- * white forces that rebuild; the difference is one of 255 per channel, so the
- * background is indistinguishable.
+ * Builds the solid background colour for a world GI value without mutating requested colors.
  *
  * @param {number|import('three').Color} color Hex colour or THREE.Color.
- * @returns {import('three').Color} Background colour for the path tracer.
+ * @returns {import('three').Color} Background colour for the scene.
  */
 export function worldBackgroundColor(color) {
-    // three's Color constructor defaults to white, so the fallback is explicit.
     const background = new Color(0x000000);
 
     if (color && color.isColor) {
-        background.set(color);
+        background.copy(color);
     } else if (color !== undefined && color !== null) {
         background.setRGB(
             ((color >> 16) & 255) / 255,
@@ -109,9 +97,50 @@ export function worldBackgroundColor(color) {
         );
     }
 
-    if (background.r === 1 && background.g === 1 && background.b === 1) {
-        background.setHex(WORKAROUND_WHITE);
+    return background;
+}
+
+/**
+ * Ensures the path tracer's internal background equirect texture is properly
+ * generated and synchronized with scene.background.
+ *
+ * In three-gpu-pathtracer, `_colorBackground` is instantiated as a
+ * GradientEquirectTexture whose constructor defaults `topColor` to 0xffffff,
+ * but without generating the procedural texture data (Float32Array buffer remains
+ * all zeros, i.e. black). When `updateEnvironment()` compares
+ * `!colorBackground.topColor.equals(scene.background)`, a requested white
+ * (0xffffff) matches the ungenerated topColor, skipping `update()`.
+ *
+ * This function guarantees that if `scene.background` is a Color, the internal
+ * background texture data is populated with the matching scene background,
+ * preserving pure white, pure black, and arbitrary colors without mutating scene data.
+ *
+ * @param {object} pathTracer Instance of WebGLPathTracer.
+ */
+export function ensurePathTracerEnvironment(pathTracer) {
+    if (!pathTracer) return;
+    const scene = pathTracer.scene;
+    if (!scene || !scene.background || !scene.background.isColor) return;
+
+    if (typeof pathTracer.updateEnvironment === 'function') {
+        pathTracer.updateEnvironment();
     }
 
-    return background;
+    const colorBg = pathTracer._colorBackground;
+    if (colorBg && typeof colorBg.update === 'function') {
+        const data = colorBg.image?.data;
+        // If data is all zero but topColor is white (or matches background),
+        // the constructor defaulted topColor without generating texture data. Force update.
+        if (data && data[0] === 0 && data[1] === 0 && data[2] === 0) {
+            const bg = scene.background;
+            if (bg.r !== 0 || bg.g !== 0 || bg.b !== 0) {
+                colorBg.topColor.copy(bg);
+                colorBg.bottomColor.copy(bg);
+                colorBg.update();
+                if (pathTracer._pathTracer?.material) {
+                    pathTracer._pathTracer.material.backgroundMap = colorBg;
+                }
+            }
+        }
+    }
 }
