@@ -1,6 +1,6 @@
 import { 
-    DirectionalLight, 
-    PointLight 
+    Color,
+    DirectionalLight 
 } from 'three';
 import { 
     ShapedAreaLight, 
@@ -24,7 +24,6 @@ export function upgradeSceneLights(scene) {
         
         // Only target Point lights acting as our data carriers
         if (child.isPointLight && child.name) {
-            console.log("[upgrade lights]: light-",child);
             const name = child.name.toLowerCase();
             let newLight = null;
 
@@ -75,11 +74,44 @@ export function upgradeSceneLights(scene) {
     // Execute the swap
     nodesToRemove.forEach(node => node.removeFromParent());
     lightsToAdd.forEach(light => scene.add(light));
-    
-    if (lightsToAdd.length > 0) {
-        console.log(`Upgraded ${lightsToAdd.length} placeholder lights.`);
-        console.log(lightsToAdd)
-    }
 
     return globalIllumination;
+}
+
+// Colour a pure white world background is nudged to, see worldBackgroundColor.
+const WORKAROUND_WHITE = 0xfefefe;
+
+/**
+ * Builds the solid background colour for a world GI value.
+ *
+ * three-gpu-pathtracer keeps a solid scene background in a gradient equirect
+ * texture that is created with a white top colour and is only rebuilt when the
+ * requested colour differs from the cached one. Because the cached colour is
+ * already white, a pure white background is never written into the texture and
+ * the tracer resolves the environment to black. Nudging the colour off pure
+ * white forces that rebuild; the difference is one of 255 per channel, so the
+ * background is indistinguishable.
+ *
+ * @param {number|import('three').Color} color Hex colour or THREE.Color.
+ * @returns {import('three').Color} Background colour for the path tracer.
+ */
+export function worldBackgroundColor(color) {
+    // three's Color constructor defaults to white, so the fallback is explicit.
+    const background = new Color(0x000000);
+
+    if (color && color.isColor) {
+        background.set(color);
+    } else if (color !== undefined && color !== null) {
+        background.setRGB(
+            ((color >> 16) & 255) / 255,
+            ((color >> 8) & 255) / 255,
+            (color & 255) / 255
+        );
+    }
+
+    if (background.r === 1 && background.g === 1 && background.b === 1) {
+        background.setHex(WORKAROUND_WHITE);
+    }
+
+    return background;
 }
